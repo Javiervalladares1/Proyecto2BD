@@ -2,113 +2,216 @@ package main
 
 import (
 	"database/sql"
-	"flag"
 	"fmt"
 	"log"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
+	"time"
 
 	_ "github.com/lib/pq"
 )
 
-// reserveSeat intenta reservar el asiento indicado para el usuario actual
-// usando un transaction con el nivel de aislamiento especificado.
-func reserveSeat(db *sql.DB, isolationLevel string, seatID int, userID int, resultChan chan<- string) {
-	// Inicia la transacción
-	tx, err := db.Begin()
-	if err != nil {
-		resultChan <- fmt.Sprintf("Usuario %d: error al iniciar transacción: %v", userID, err)
-		return
+// ReservationResult almacena el resultado de cada usuario al intentar reservar
+type ReservationResult struct {
+	userID   int
+	success  bool
+	duration time.Duration
+	message  string
+}
+
+// reserveSeat maneja la lógica de reservar un asiento con transacciones y reintentos en caso de error de serialización
+func reserveSeat(db *sql.DB, isolationLevel string, seatID int, userID int) ReservationResult {
+	const maxRetries = 5
+	start := time.Now()
+	var finalMsg string
+	var success bool
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		tx, err := db.Begin()
+		if err != nil {
+			finalMsg = fmt.Sprintf("error starting transaction: %v", err)
+			break
+		}
+
+		// Ajusta el nivel de aislamiento
+		setQuery := fmt.Sprintf("SET TRANSACTION ISOLATION LEVEL %s", isolationLevel)
+		if _, err := tx.Exec(setQuery); err != nil {
+			tx.Rollback()
+			finalMsg = fmt.Sprintf("error setting isolation level: %v", err)
+			break
+		}
+
+		// Bloquea el registro del asiento con FOR UPDATE
+		var isReserved bool
+		err = tx.QueryRow("SELECT is_reserved FROM seats WHERE id = $1 FOR UPDATE", seatID).Scan(&isReserved)
+		if err != nil {
+			tx.Rollback()
+			finalMsg = fmt.Sprintf("error selecting seat %d: %v", seatID, err)
+			break
+		}
+
+		// Si el asiento ya está reservado, no reintentar
+		if isReserved {
+			tx.Rollback()
+			finalMsg = fmt.Sprintf("seat %d already reserved", seatID)
+			break
+		}
+
+		// Inserta la reserva en la tabla
+		_, err = tx.Exec("INSERT INTO reservations(user_id, seat_id, status) VALUES ($1, $2, 'confirmed')", userID, seatID)
+		if err != nil {
+			tx.Rollback()
+			if strings.Contains(err.Error(), "duplicate key value violates unique constraint") {
+				finalMsg = fmt.Sprintf("seat %d already reserved", seatID)
+				break
+			} else if strings.Contains(err.Error(), "could not serialize access") {
+				// Error de serialización => reintento
+				if attempt == maxRetries {
+					finalMsg = fmt.Sprintf("failed to insert reservation for seat %d after %d attempts: %v", seatID, attempt, err)
+					break
+				}
+				time.Sleep(time.Duration(200*attempt) * time.Millisecond)
+				continue
+			} else {
+				finalMsg = fmt.Sprintf("error inserting reservation: %v", err)
+				break
+			}
+		}
+
+		// Actualiza el estado del asiento a reservado
+		_, err = tx.Exec("UPDATE seats SET is_reserved = TRUE WHERE id = $1", seatID)
+		if err != nil {
+			tx.Rollback()
+			finalMsg = fmt.Sprintf("error updating seat: %v", err)
+			break
+		}
+
+		// Intenta confirmar la transacción
+		err = tx.Commit()
+		if err != nil {
+			if strings.Contains(err.Error(), "could not serialize access") {
+				if attempt == maxRetries {
+					finalMsg = fmt.Sprintf("failed to commit reservation for seat %d after %d attempts: %v", seatID, attempt, err)
+					break
+				}
+				time.Sleep(time.Duration(200*attempt) * time.Millisecond)
+				continue
+			} else {
+				finalMsg = fmt.Sprintf("error committing transaction: %v", err)
+				break
+			}
+		}
+
+		// Si llega aquí, la reserva fue exitosa.
+		finalMsg = fmt.Sprintf("reservation confirmed for seat %d", seatID)
+		success = true
+		break
 	}
 
-	// Configura el nivel de aislamiento de la transacción
-	query := fmt.Sprintf("SET TRANSACTION ISOLATION LEVEL %s", isolationLevel)
-	if _, err := tx.Exec(query); err != nil {
-		tx.Rollback()
-		resultChan <- fmt.Sprintf("Usuario %d: error al establecer aislamiento (%s): %v", userID, isolationLevel, err)
-		return
+	duration := time.Since(start)
+	return ReservationResult{
+		userID:   userID,
+		success:  success,
+		duration: duration,
+		message:  finalMsg,
 	}
-
-	// Bloquea el registro del asiento para evitar conflictos (consulta FOR UPDATE)
-	var isReserved bool
-	err = tx.QueryRow("SELECT is_reserved FROM seats WHERE id = $1 FOR UPDATE", seatID).Scan(&isReserved)
-	if err != nil {
-		tx.Rollback()
-		resultChan <- fmt.Sprintf("Usuario %d: error al consultar el asiento %d: %v", userID, seatID, err)
-		return
-	}
-
-	// Si el asiento ya está reservado, se cancela la transacción
-	if isReserved {
-		tx.Rollback()
-		resultChan <- fmt.Sprintf("Usuario %d: el asiento %d ya está reservado", userID, seatID)
-		return
-	}
-
-	// Inserta el registro en la tabla reservations
-	_, err = tx.Exec("INSERT INTO reservations(user_id, seat_id, status) VALUES ($1, $2, 'confirmed')", userID, seatID)
-	if err != nil {
-		tx.Rollback()
-		resultChan <- fmt.Sprintf("Usuario %d: error al insertar reserva: %v", userID, err)
-		return
-	}
-
-	// Actualiza el estado del asiento a reservado
-	_, err = tx.Exec("UPDATE seats SET is_reserved = TRUE WHERE id = $1", seatID)
-	if err != nil {
-		tx.Rollback()
-		resultChan <- fmt.Sprintf("Usuario %d: error al actualizar el asiento: %v", userID, err)
-		return
-	}
-
-	// Intenta confirmar la transacción
-	if err = tx.Commit(); err != nil {
-		resultChan <- fmt.Sprintf("Usuario %d: error al confirmar transacción: %v", userID, err)
-		return
-	}
-
-	resultChan <- fmt.Sprintf("Usuario %d: reserva confirmada para el asiento %d", userID, seatID)
 }
 
 func main() {
-	// Parámetros de línea de comandos
-	isolationPtr := flag.String("isolation", "READ COMMITTED", "Nivel de aislamiento: READ COMMITTED, REPEATABLE READ, SERIALIZABLE")
-	numUsersPtr := flag.Int("users", 5, "Número de usuarios concurrentes")
-	seatIDPtr := flag.Int("seat", 1, "ID del asiento a reservar")
-	flag.Parse()
+	// Lee variables de entorno o usa valores por defecto
+	isolationLevel := os.Getenv("ISOLATION_LEVEL")
+	if isolationLevel == "" {
+		isolationLevel = "READ COMMITTED"
+	}
 
-	// Cadena de conexión a PostgreSQL (ajusta host, usuario, contraseña y nombre de base de datos según tu configuración)
-	connStr := "host=localhost port=5432 user=postgres password=postgres dbname=reservasdb sslmode=disable"
+	numUsers := 5
+	if env := os.Getenv("NUM_USERS"); env != "" {
+		if parsed, err := strconv.Atoi(env); err == nil {
+			numUsers = parsed
+		}
+	}
+
+	dbHost := os.Getenv("DB_HOST")
+	if dbHost == "" {
+		dbHost = "localhost"
+	}
+
+	dbPort := os.Getenv("DB_PORT")
+	if dbPort == "" {
+		dbPort = "5436"
+	}
+
+	dbUser := os.Getenv("DB_USER")
+	if dbUser == "" {
+		dbUser = "postgres"
+	}
+
+	dbPassword := os.Getenv("DB_PASSWORD")
+	if dbPassword == "" {
+		dbPassword = "postgres"
+	}
+
+	dbName := os.Getenv("DB_NAME")
+	if dbName == "" {
+		dbName = "ticketstracker"
+	}
+
+	// Construir la cadena de conexión
+	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+		dbHost, dbPort, dbUser, dbPassword, dbName)
 	db, err := sql.Open("postgres", connStr)
 	if err != nil {
-		log.Fatal("Error conectando a la base de datos: ", err)
+		log.Fatalf("Error connecting to DB: %v", err)
 	}
 	defer db.Close()
 
-	// Prueba la conexión a la base de datos
+	// Verifica la conexión
 	if err := db.Ping(); err != nil {
-		log.Fatal("No se pudo conectar a la base de datos: ", err)
+		log.Fatalf("Error pinging DB: %v", err)
 	}
+	fmt.Println("Connected to PostgreSQL!")
+	fmt.Printf("Simulating %d users attempting to reserve seats with isolation %s\n", numUsers, isolationLevel)
 
-	// Canal para recibir resultados de cada goroutine
-	resultChan := make(chan string, *numUsersPtr)
+	// Lista de asientos libres, ajústalo a tu data.sql
+
+	freeSeats := []int{1, 3, 5}
+
+	// Canal y WaitGroup para los resultados
 	var wg sync.WaitGroup
+	resultChan := make(chan ReservationResult, numUsers)
 
-	fmt.Printf("Simulación de %d usuarios intentando reservar el asiento %d con nivel de aislamiento %s\n", *numUsersPtr, *seatIDPtr, *isolationPtr)
-
-	// Lanza las goroutines para simular usuarios concurrentes
-	for i := 1; i <= *numUsersPtr; i++ {
+	// Lógica de round-robin: cada usuario coge un asiento del array freeSeats
+	for i := 1; i <= numUsers; i++ {
 		wg.Add(1)
-		go func(userID int) {
+		seatID := freeSeats[(i-1)%len(freeSeats)]
+		go func(userID, seat int) {
 			defer wg.Done()
-			reserveSeat(db, *isolationPtr, *seatIDPtr, userID, resultChan)
-		}(i)
+			res := reserveSeat(db, isolationLevel, seat, userID)
+			resultChan <- res
+		}(i, seatID)
 	}
 
 	wg.Wait()
 	close(resultChan)
 
-	// Muestra los resultados obtenidos
+	// Recolectar resultados
+	var successCount, failureCount int
+	var totalTime time.Duration
 	for res := range resultChan {
-		fmt.Println(res)
+		fmt.Printf("User %d: %s (in %v)\n", res.userID, res.message, res.duration)
+		totalTime += res.duration
+		if res.success {
+			successCount++
+		} else {
+			failureCount++
+		}
 	}
+
+	avgTime := totalTime / time.Duration(numUsers)
+	fmt.Println("--------------------------------------------------")
+	fmt.Printf("Usuarios Concurrentes: %d\tAislamiento: %s\tExitosas: %d\tFallidas: %d\tPromedio: %d ms\n",
+		numUsers, isolationLevel, successCount, failureCount, avgTime.Milliseconds())
+
 }
